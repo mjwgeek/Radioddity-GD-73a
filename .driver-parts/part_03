@@ -1,0 +1,341 @@
+            raw = _u16(d, off + 0x11 + i * 2)
+            members.append(raw - 1 if raw else None)
+        return {
+            "index": index0,
+            "name": _decode_utf16(d[off:off + 0x10]),
+            "count": count,
+            "members": members,
+            "pri1_mode": _byte(d, off + 0x51),
+            "pri2_mode": _byte(d, off + 0x52),
+            "pri1_zone": _byte(d, off + 0x53),
+            "pri2_zone": _byte(d, off + 0x54),
+            "pri1_channel": _byte(d, off + 0x55),
+            "pri2_channel": _byte(d, off + 0x57),
+            "revert_mode": _byte(d, off + 0x59),
+            "revert_zone": _byte(d, off + 0x5A),
+            "revert_channel": _byte(d, off + 0x5B),
+            "rx_hold_raw": _byte(d, off + 0x5D),
+            "tx_hold_raw": _byte(d, off + 0x5E),
+        }
+
+    def _scanlist_choices(self):
+        # Channel scan-list field is 0=None, then 1-based scan-list index.
+        out = ["None"]
+        for i in range(self._scanlist_count()):
+            s = self._scanlist(i)
+            out.append("%d: %s" % (i + 1, s["name"]))
+        return out
+
+    def get_features(self):
+        rf = chirp_common.RadioFeatures()
+        rf.has_settings = True
+        rf.has_bank = False
+        rf.has_name = True
+        rf.has_offset = True
+        rf.has_mode = True
+        rf.has_tuning_step = False
+        rf.has_ctone = True
+        rf.has_cross = True
+        rf.has_rx_dtcs = True
+        rf.has_dtcs_polarity = True
+        rf.valid_modes = ["FM", "NFM", "DMR"]
+        rf.valid_tmodes = ["", "Tone", "TSQL", "DTCS", "Cross"]
+        rf.valid_cross_modes = [
+            "Tone->Tone",
+            "DTCS->",
+            "->DTCS",
+            "Tone->DTCS",
+            "DTCS->Tone",
+            "->Tone",
+            "DTCS->DTCS",
+        ]
+        rf.valid_duplexes = ["", "-", "+", "split", "off"]
+        rf.valid_skips = [""]
+        rf.valid_power_levels = POWER_LEVELS
+        rf.valid_name_length = 16
+        rf.valid_characters = chirp_common.CHARSET_ASCII
+        rf.valid_bands = [(400000000, 470000000)]
+        rf.memory_bounds = (1, max(1, self._channel_count()))
+        rf.has_sub_devices = (self.VARIANT == "Native USB read v4 / mmap parser fix")
+        return rf
+
+    def get_raw_memory(self, number):
+        d = self._m()
+        off = self._channel_off(number)
+        return repr(bytes(d[off:off + CHANNEL_SIZE]))
+
+    def get_memory(self, number):
+        d = self._m()
+        off = self._channel_off(number)
+        raw = bytes(d[off:off + CHANNEL_SIZE])
+
+        mem = chirp_common.Memory()
+        mem.number = number
+        mem.name = _decode_utf16(raw[O_NAME:O_NAME + 0x20])
+        mem.freq = _u32(raw, O_RXFREQ)
+        tx = _u32(raw, O_TXFREQ)
+
+        if raw[O_RXONLY]:
+            mem.duplex = "off"
+            mem.offset = 0
+        elif tx == mem.freq:
+            mem.duplex = ""
+            mem.offset = 0
+        else:
+            delta = tx - mem.freq
+            if abs(delta) <= 10000000:
+                mem.duplex = "+" if delta > 0 else "-"
+                mem.offset = abs(delta)
+            else:
+                mem.duplex = "split"
+                mem.offset = tx
+
+        if raw[O_TYPE] == 1:
+            mem.mode = "DMR"
+        else:
+            # Exact GD-73 encoding: 0=Narrow (12.5K), 1=Wide (25K).
+            mem.mode = "FM" if raw[O_BANDWIDTH] == 1 else "NFM"
+
+            tx_tone = _decode_gd73_tone(
+                raw[O_TX_TONE_MODE],
+                raw[O_TX_CTCSS],
+                raw[O_TX_DCS])
+            rx_tone = _decode_gd73_tone(
+                raw[O_RX_TONE_MODE],
+                raw[O_RX_CTCSS],
+                raw[O_RX_DCS])
+            chirp_common.split_tone_decode(mem, tx_tone, rx_tone)
+
+        if raw[O_POWER] in (0, 1):
+            mem.power = POWER_LEVELS[raw[O_POWER]]
+
+        extra = RadioSettingGroup("extra", "GD-73A")
+        extra.append(RadioSetting(
+            "rx_only", "RX Only",
+            RadioSettingValueBoolean(bool(raw[O_RXONLY]))))
+        extra.append(RadioSetting(
+            "talkaround", "Talkaround",
+            RadioSettingValueBoolean(bool(raw[O_TALKAROUND]))))
+        extra.append(RadioSetting(
+            "scan_autostart", "Scan Auto Start",
+            RadioSettingValueBoolean(bool(raw[O_SCANAUTOSTART]))))
+
+        if raw[O_TYPE] == 1:
+            extra.append(RadioSetting(
+                "timeslot", "DMR Time Slot",
+                RadioSettingValueList(
+                    ["TS1", "TS2"],
+                    current_index=1 if raw[O_TIMESLOT] else 0)))
+            extra.append(RadioSetting(
+                "colorcode", "DMR Color Code",
+                RadioSettingValueInteger(
+                    0, 15, min(15, int(raw[O_COLORCODE])))))
+
+            contact_raw = _u16(raw, O_CONTACT)
+            choices = self._contact_choices()
+            if contact_raw >= len(choices):
+                contact_raw = 0
+            extra.append(RadioSetting(
+                "contact", "DMR TX Contact",
+                RadioSettingValueList(
+                    choices, current_index=contact_raw)))
+
+            group_raw = _u16(raw, O_GROUPLIST)
+            group_choices = self._rxgroup_choices()
+            if group_raw >= len(group_choices):
+                group_raw = 1
+            extra.append(RadioSetting(
+                "group_list", "RX Group List",
+                RadioSettingValueList(
+                    group_choices, current_index=group_raw)))
+
+        scan_raw = int(raw[O_SCANLIST])
+        scan_choices = self._scanlist_choices()
+        if scan_raw >= len(scan_choices):
+            scan_raw = 0
+        extra.append(RadioSetting(
+            "scan_list", "Scan List",
+            RadioSettingValueList(
+                scan_choices, current_index=scan_raw)))
+
+        mem.extra = extra
+        return mem
+
+    def set_memory(self, mem):
+        d = self._m()
+        off = self._channel_off(mem.number)
+        raw = bytearray(bytes(d[off:off + CHANNEL_SIZE]))
+
+        raw[O_NAME:O_NAME + 0x20] = _encode_utf16(mem.name, 16)
+        raw[O_RXFREQ:O_RXFREQ + 4] = _p32(mem.freq)
+
+        if mem.duplex == "off":
+            tx = mem.freq
+            raw[O_RXONLY] = 1
+        elif mem.duplex == "+":
+            tx = mem.freq + mem.offset
+            raw[O_RXONLY] = 0
+        elif mem.duplex == "-":
+            tx = mem.freq - mem.offset
+            raw[O_RXONLY] = 0
+        elif mem.duplex == "split":
+            tx = mem.offset
+            raw[O_RXONLY] = 0
+        else:
+            tx = mem.freq
+            raw[O_RXONLY] = 0
+        raw[O_TXFREQ:O_TXFREQ + 4] = _p32(tx)
+
+        if mem.mode == "DMR":
+            raw[O_TYPE] = 1
+        else:
+            raw[O_TYPE] = 0
+            # Exact GD-73 encoding: 0=Narrow, 1=Wide.
+            raw[O_BANDWIDTH] = 1 if mem.mode == "FM" else 0
+
+            tx_tone, rx_tone = chirp_common.split_tone_encode(mem)
+            tx_mode, tx_ctcss, tx_dcs = _encode_gd73_tone(tx_tone)
+            rx_mode, rx_ctcss, rx_dcs = _encode_gd73_tone(rx_tone)
+
+            raw[O_TX_TONE_MODE] = tx_mode
+            raw[O_TX_CTCSS] = tx_ctcss
+            raw[O_TX_DCS] = tx_dcs
+            raw[O_RX_TONE_MODE] = rx_mode
+            raw[O_RX_CTCSS] = rx_ctcss
+            raw[O_RX_DCS] = rx_dcs
+
+        if mem.power is not None:
+            try:
+                raw[O_POWER] = POWER_LEVELS.index(mem.power)
+            except ValueError:
+                pass
+
+        for setting in getattr(mem, "extra", []):
+            name = setting.get_name()
+            if name == "rx_only":
+                raw[O_RXONLY] = 1 if bool(setting.value) else 0
+            elif name == "talkaround":
+                raw[O_TALKAROUND] = 1 if bool(setting.value) else 0
+            elif name == "scan_autostart":
+                raw[O_SCANAUTOSTART] = 1 if bool(setting.value) else 0
+            elif name == "timeslot":
+                raw[O_TIMESLOT] = int(setting.value)
+            elif name == "colorcode":
+                raw[O_COLORCODE] = int(setting.value)
+            elif name == "contact":
+                raw[O_CONTACT:O_CONTACT + 2] = _p16(int(setting.value))
+            elif name == "group_list":
+                raw[O_GROUPLIST:O_GROUPLIST + 2] = _p16(int(setting.value))
+            elif name == "scan_list":
+                raw[O_SCANLIST] = int(setting.value)
+
+        _set_bytes(d, off, bytes(raw))
+
+    def _message_count(self):
+        return min(_byte(self._m(), MESSAGE_BASE), 16)
+
+    def _message(self, index0):
+        if index0 < 0 or index0 >= 16:
+            return ""
+        d = self._m()
+        off = MESSAGE_BASE + 1 + index0 * 0x51
+        length = min(_byte(d, off), 40)
+        raw = bytes(d[off + 1:off + 1 + length * 2])
+        try:
+            return raw.decode("utf-16le", "replace").rstrip("\x00")
+        except Exception:
+            return ""
+
+    def _dtmf_system(self, index0):
+        d = self._m()
+        off = DTMF_SYSTEM_BASE + index0 * DTMF_SYSTEM_SIZE
+        return {
+            "sidetone": bool(_byte(d, off + 0)),
+            "pre_ms": _byte(d, off + 1) * 10,
+            # Verified: raw 0 = 30 ms in CPS.
+            "tone_ms": 30 + _byte(d, off + 2) * 10,
+            "interval_ms": 30 + _byte(d, off + 3) * 10,
+            # Verified: raw 10 = 2.2 s in CPS.
+            "restore_ms": 200 + _byte(d, off + 4) * 200,
+        }
+
+    def _dtmf_number(self, index0):
+        """Decode one GD-73 DTMF code.
+
+        CPS-validated format:
+          byte 0: digit count, 0..16
+          bytes 1..8: packed BCD, high nibble first
+
+        Example:
+          "1"  -> 01 10 00 00 00 00 00 00 00
+          "10" -> 02 10 00 00 00 00 00 00 00
+          "16" -> 02 16 00 00 00 00 00 00 00
+
+        Numeric digits 0-9 are fully validated. Non-numeric DTMF symbols
+        remain intentionally unsupported until captured from CPS.
+        """
+        d = self._m()
+        off = DTMF_NUMBER_BASE + index0 * DTMF_NUMBER_SIZE
+        count = min(_byte(d, off), 16)
+        if not count:
+            return ""
+
+        digits = []
+        for b in bytes(d[off + 1:off + 9]):
+            digits.append((b >> 4) & 0x0F)
+            digits.append(b & 0x0F)
+
+        decode_map = {
+            0x0: "0", 0x1: "1", 0x2: "2", 0x3: "3", 0x4: "4",
+            0x5: "5", 0x6: "6", 0x7: "7", 0x8: "8", 0x9: "9",
+            0xA: "A", 0xB: "B", 0xC: "C", 0xD: "D",
+            0xE: "*",
+            0xF: "#",
+        }
+        return "".join(decode_map.get(nibble, "?")
+                       for nibble in digits[:count])
+
+
+    def _encode_dtmf_number(self, value):
+        """Encode a validated numeric GD-73 DTMF code into its 9-byte record."""
+        value = str(value).strip().upper()
+        if len(value) > 16:
+            raise errors.RadioError(
+                "GD-73 DTMF codes are limited to 16 characters")
+
+        encode_map = {
+            "0": 0x0, "1": 0x1, "2": 0x2, "3": 0x3, "4": 0x4,
+            "5": 0x5, "6": 0x6, "7": 0x7, "8": 0x8, "9": 0x9,
+            "A": 0xA, "B": 0xB, "C": 0xC, "D": 0xD,
+            "*": 0xE, "#": 0xF,
+        }
+
+        invalid = [ch for ch in value if ch not in encode_map]
+        if invalid:
+            raise errors.RadioError(
+                "Unsupported GD-73 DTMF character(s): %s. "
+                "Allowed: 0-9, A-D, *, #." %
+                ", ".join(sorted(set(invalid))))
+
+        packed = bytearray(8)
+        for i, ch in enumerate(value):
+            nibble = encode_map[ch]
+            byte_index = i // 2
+            if i % 2 == 0:
+                packed[byte_index] |= nibble << 4
+            else:
+                packed[byte_index] |= nibble
+        return bytes([len(value)]) + bytes(packed)
+
+    def _ptt_template(self, index0):
+        d = self._m()
+        off = DTMF_PTT_BASE + index0 * DTMF_PTT_SIZE
+        return {
+            "system": _byte(d, off + 0),
+            "type": _byte(d, off + 1),
+            "mode": _byte(d, off + 2),
+            "connect": _byte(d, off + 3),
+            "disconnect": _byte(d, off + 4),
+        }
+
+    def _emergency_count(self):
