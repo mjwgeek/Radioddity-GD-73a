@@ -1,0 +1,33 @@
+name: Assemble GD-73A driver
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  assemble:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Assemble and verify driver
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f .driver-parts/part_08
+          cat .driver-parts/part_00 .driver-parts/part_01 .driver-parts/part_02 .driver-parts/part_03 .driver-parts/part_04 .driver-parts/part_05 .driver-parts/part_06 .driver-parts/part_07 .driver-parts/part_08 > gd73.py
+          echo "99404161f66e2eae4df5e685e94d7e12f9361dc5640d37fbe200b969c59a1f21  gd73.py" | sha256sum -c -
+          python -m py_compile gd73.py
+      - name: Commit assembled driver
+        shell: bash
+        run: |
+          if git diff --quiet -- gd73.py; then
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add gd73.py
+          git commit -m "Publish verified GD-73A CHIRP driver"
+          git push
