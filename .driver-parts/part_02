@@ -1,0 +1,328 @@
+        # QDMR's known receive endpoint is 0x81. Ignore zero-filled frames
+        # briefly because the vendor stack has been observed returning them.
+        for attempt in range(11):
+            try:
+                rx = bytes(dev.read(
+                    USB_EP_IN, 64, timeout=USB_TIMEOUT_MS))
+            except Exception as e:
+                if (usb is not None and
+                        isinstance(e, usb.core.USBTimeoutError)):
+                    LOG.debug(
+                        "GD73 USB RX timeout attempt %d", attempt + 1)
+                    continue
+                raise errors.RadioError("GD-73A USB read failed: %s" % e)
+
+            LOG.debug("GD73 USB RX: %s", rx.hex(" "))
+            if rx and rx[0] == 0x68:
+                try:
+                    return _parse_c7000(rx)
+                except ValueError as e:
+                    raise errors.RadioError(
+                        "Invalid GD-73A C7000 response: %s" % e)
+
+            if rx and any(rx):
+                LOG.warning(
+                    "GD73 non-C7000 RX attempt %d: %s",
+                    attempt + 1, rx.hex(" "))
+
+        raise errors.RadioError(
+            "GD-73A did not return a valid C7000 response on USB 0x81 "
+            "after 11 QDMR-style reads (only empty/zero responses were received).")
+
+    def _read_usb_image(self, dev):
+        # Enter programming mode.
+        payload = self._usb_send_recv(
+            dev, _c7000_packet(0x01, 0x04))
+        LOG.info("GD73 programming-mode payload: %s", payload.hex(" "))
+
+        image = bytearray()
+        last_sequence = 0xFFFF
+
+        status = chirp_common.Status()
+        status.max = BLOCK_COUNT
+        status.cur = 0
+        status.msg = "Reading GD-73A"
+        if self.status_fn:
+            self.status_fn(status)
+
+        for block in range(BLOCK_COUNT):
+            if block == 0:
+                request = _c7000_packet(0x01, 0x02)
+            else:
+                request = _c7000_packet(
+                    0x04, 0x01, 0x0F,
+                    struct.pack("<H", last_sequence))
+
+            payload = self._usb_send_recv(dev, request)
+            if len(payload) < 2 + BLOCK_SIZE:
+                raise errors.RadioError(
+                    "GD-73A short block response at %d: %d bytes" %
+                    (block, len(payload)))
+
+            seq = struct.unpack_from("<H", payload, 0)[0]
+            if seq != block:
+                raise errors.RadioError(
+                    "GD-73A sequence error: expected %d got %d" %
+                    (block, seq))
+
+            image.extend(payload[2:2 + BLOCK_SIZE])
+            last_sequence = seq
+
+            status.cur = block + 1
+            if self.status_fn and (
+                    block == 0 or (block + 1) % 10 == 0 or
+                    block + 1 == BLOCK_COUNT):
+                self.status_fn(status)
+
+        if len(image) != IMAGE_SIZE:
+            raise errors.RadioError(
+                "GD-73A image size mismatch: got %d expected %d" %
+                (len(image), IMAGE_SIZE))
+
+        return bytes(image)
+
+    def sync_in(self):
+        """Download directly from the native C7000 USB device."""
+        dev = None
+        try:
+            dev = self._open_usb()
+            started = time.perf_counter()
+            image = self._read_usb_image(dev)
+            elapsed = time.perf_counter() - started
+            LOG.info(
+                "GD73 USB image read: %d bytes in %.3f seconds (%.1f KiB/s)",
+                len(image), elapsed,
+                (len(image) / 1024.0 / elapsed) if elapsed else 0.0)
+            self._mmap = memmap.MemoryMapBytes(image)
+            self.process_mmap()
+            LOG.info("GD73 live USB download complete: %d bytes", len(image))
+        finally:
+            if dev is not None:
+                if getattr(dev, "_is_libusb0", False):
+                    dev.close()
+                elif usb is not None:
+                    try:
+                        usb.util.release_interface(dev, USB_INTERFACE)
+                    except Exception:
+                        pass
+                    try:
+                        usb.util.dispose_resources(dev)
+                    except Exception:
+                        pass
+
+    def _write_usb_image(self, dev, image):
+        """Write a complete C7000 codeplug image using the OEM CPS sequence."""
+        image = bytes(image)
+        if len(image) != IMAGE_SIZE:
+            raise errors.RadioError(
+                "Refusing GD-73A upload: image is %d bytes, expected exactly %d" %
+                (len(image), IMAGE_SIZE))
+
+        # OEM capture enters programming mode before the first write block.
+        payload = self._usb_send_recv(
+            dev, _c7000_packet(0x01, 0x04))
+        LOG.info("GD73 write programming-mode payload: %s", payload.hex(" "))
+
+        status = chirp_common.Status()
+        status.max = BLOCK_COUNT
+        status.cur = 0
+        status.msg = "Writing GD-73A"
+        if self.status_fn:
+            self.status_fn(status)
+
+        for block in range(BLOCK_COUNT):
+            start = block * BLOCK_SIZE
+            chunk = image[start:start + BLOCK_SIZE]
+            if len(chunk) != BLOCK_SIZE:
+                raise errors.RadioError(
+                    "Refusing GD-73A upload: short source block %d (%d bytes)" %
+                    (block, len(chunk)))
+
+            # OEM CPS capture:
+            #   request command/sub = 0x01/0x00
+            #   payload length = 0x37 = 55 bytes
+            #   payload = uint16_le(sequence) + 53-byte codeplug block
+            request = _c7000_packet(
+                0x01, 0x00, 0x0F,
+                struct.pack("<H", block) + chunk)
+
+            # IMPORTANT: _usb_send_recv() may retry IN reads after a zero
+            # frame, but it never resends the write request. This avoids
+            # ambiguous duplicate writes.
+            ack = self._usb_send_recv(dev, request)
+
+            # OEM ACK command/sub is 0x00/0x01 and its payload is the
+            # two-byte sequence number. _usb_send_recv() returns payload.
+            if len(ack) != 2:
+                raise errors.RadioError(
+                    "GD-73A invalid write ACK at block %d: expected 2 bytes, "
+                    "got %d" % (block, len(ack)))
+
+            ack_seq = struct.unpack("<H", ack)[0]
+            if ack_seq != block:
+                raise errors.RadioError(
+                    "GD-73A write sequence ACK mismatch: sent %d, got %d" %
+                    (block, ack_seq))
+
+            status.cur = block + 1
+            if self.status_fn and (
+                    block == 0 or (block + 1) % 10 == 0 or
+                    block + 1 == BLOCK_COUNT):
+                self.status_fn(status)
+
+        LOG.info("GD73 USB upload complete: %d blocks / %d bytes",
+                 BLOCK_COUNT, len(image))
+
+    def sync_out(self):
+        """Upload the current image to the native C7000 USB device."""
+        if self._mmap is None:
+            raise errors.RadioError(
+                "Refusing GD-73A upload: no codeplug image is loaded.")
+
+        image = self._mmap.get_packed()
+        if not isinstance(image, bytes):
+            image = bytes(image)
+
+        if len(image) != IMAGE_SIZE:
+            raise errors.RadioError(
+                "Refusing GD-73A upload: image is %d bytes, expected exactly %d" %
+                (len(image), IMAGE_SIZE))
+
+        dev = None
+        try:
+            dev = self._open_usb()
+            started = time.perf_counter()
+            self._write_usb_image(dev, image)
+            elapsed = time.perf_counter() - started
+            LOG.info(
+                "GD73 USB image write: %d bytes in %.3f seconds (%.1f KiB/s)",
+                len(image), elapsed,
+                (len(image) / 1024.0 / elapsed) if elapsed else 0.0)
+        finally:
+            if dev is not None:
+                if getattr(dev, "_is_libusb0", False):
+                    dev.close()
+                elif usb is not None:
+                    try:
+                        usb.util.release_interface(dev, USB_INTERFACE)
+                    except Exception:
+                        pass
+                    try:
+                        usb.util.dispose_resources(dev)
+                    except Exception:
+                        pass
+
+    def _m(self):
+        return self._mmap.get_byte_compatible()
+
+    def _channel_count(self):
+        return min(_u16(self._m(), CHANNEL_BANK), 1024)
+
+    def _contact_count(self):
+        return min(_u16(self._m(), CONTACT_BANK), 1024)
+
+    def _channel_off(self, number):
+        if number < 1 or number > self._channel_count():
+            raise errors.InvalidMemoryLocation(
+                "Memory %s outside GD-73 channel count" % number)
+        return CHANNEL_RECORDS + (number - 1) * CHANNEL_SIZE
+
+    def _contact(self, index0):
+        if index0 < 0 or index0 >= self._contact_count():
+            return None
+        d = self._m()
+        off = CONTACT_RECORDS + index0 * CONTACT_SIZE
+        return {
+            "index": index0,
+            "name": _decode_utf16(d[off:off + 0x20]),
+            "type": _byte(d, off + 0x20),
+            "id": _u32(d, off + 0x21),
+        }
+
+    def _contact_choices(self):
+        out = ["None"]
+        for i in range(self._contact_count()):
+            c = self._contact(i)
+            out.append("%d: %s (%d)" % (i + 1, c["name"], c["id"]))
+        return out
+
+    def _channel_name(self, index0):
+        if index0 < 0 or index0 >= self._channel_count():
+            return ""
+        d = self._m()
+        off = CHANNEL_RECORDS + index0 * CHANNEL_SIZE
+        return _decode_utf16(d[off:off + 0x20])
+
+    def _channel_choices(self):
+        out = ["None"]
+        for i in range(self._channel_count()):
+            out.append("%d: %s" % (i + 1, self._channel_name(i)))
+        return out
+
+    def _zone_count(self):
+        return min(_byte(self._m(), ZONE_BANK), 64)
+
+    def _zone(self, index0):
+        if index0 < 0 or index0 >= self._zone_count():
+            return None
+        d = self._m()
+        off = ZONE_RECORDS + index0 * ZONE_SIZE
+        count = min(_byte(d, off + 0x10), 16)
+        members = []
+        for i in range(16):
+            raw = _u16(d, off + 0x11 + i * 2)
+            members.append(raw - 1 if raw else None)
+        return {
+            "index": index0,
+            "name": _decode_utf16(d[off:off + 0x10]),
+            "count": count,
+            "members": members,
+        }
+
+    def _zone_choices(self):
+        out = ["None"]
+        for i in range(self._zone_count()):
+            z = self._zone(i)
+            out.append("%d: %s" % (i + 1, z["name"]))
+        return out
+
+    def _rxgroup_count(self):
+        return min(_byte(self._m(), RXGROUP_BANK), 250)
+
+    def _rxgroup(self, index0):
+        if index0 < 0 or index0 >= self._rxgroup_count():
+            return None
+        d = self._m()
+        off = RXGROUP_RECORDS + index0 * RXGROUP_SIZE
+        count = min(_byte(d, off + 0x10), 33)
+        members = []
+        for i in range(33):
+            raw = _u16(d, off + 0x11 + i * 2)
+            members.append(raw - 1 if raw else None)
+        return {
+            "index": index0,
+            "name": _decode_utf16(d[off:off + 0x10]),
+            "count": count,
+            "members": members,
+        }
+
+    def _rxgroup_choices(self):
+        # The channel field is encoded specially:
+        #   0 = use TX contact, 1 = all match, 2+ = RX group index + 2.
+        out = ["TX Contact", "All"]
+        for i in range(self._rxgroup_count()):
+            g = self._rxgroup(i)
+            out.append("%d: %s" % (i + 1, g["name"]))
+        return out
+
+    def _scanlist_count(self):
+        return min(_byte(self._m(), SCANLIST_BANK), 16)
+
+    def _scanlist(self, index0):
+        if index0 < 0 or index0 >= self._scanlist_count():
+            return None
+        d = self._m()
+        off = SCANLIST_RECORDS + index0 * SCANLIST_SIZE
+        count = min(_byte(d, off + 0x10), 32)
+        members = []
+        for i in range(32):
