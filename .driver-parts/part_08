@@ -1,0 +1,134 @@
+    """The fixed sixteen-entry DTMF Code table."""
+
+    VARIANT = "DTMF Codes"
+    MAX_RECORDS = 16
+    NAME_LENGTH = 16
+
+    def get_memory(self, number):
+        if number < 1 or number > 16:
+            raise errors.InvalidMemoryLocation(number)
+        code = self._dtmf_number(number - 1)
+        if not code:
+            return self._base_memory(number, empty=True)
+        return self._base_memory(number, code, empty=False)
+
+    def set_memory(self, mem):
+        if mem.empty:
+            return self.erase_memory(mem.number)
+        off = DTMF_NUMBER_BASE + (mem.number - 1) * DTMF_NUMBER_SIZE
+        _set_bytes(self._m(), off, self._encode_dtmf_number(mem.name))
+
+    def erase_memory(self, number):
+        off = DTMF_NUMBER_BASE + (number - 1) * DTMF_NUMBER_SIZE
+        _set_bytes(self._m(), off, b"\x00" * DTMF_NUMBER_SIZE)
+
+
+class GD73PTTTemplatesRadio(GD73CollectionRadio):
+    """The fixed 32-entry DTMF PTT Template table."""
+
+    VARIANT = "PTT Templates"
+    MAX_RECORDS = 32
+    NAME_LENGTH = 8
+
+    def get_features(self):
+        rf = super().get_features()
+        rf.can_delete = False
+        return rf
+
+    def get_memory(self, number):
+        if number < 1 or number > 32:
+            raise errors.InvalidMemoryLocation(number)
+        p = self._ptt_template(number - 1)
+        mem = self._base_memory(
+            number, "PTT %02d" % number, empty=False)
+        mem.immutable.append("name")
+
+        systems = ["DTMF1", "DTMF2", "DTMF3", "DTMF4"]
+        ids = ["None"] + [
+            "DTMF Code %d" % (i + 1) for i in range(16)]
+
+        mem.extra.append(RadioSetting(
+            "system", "DTMF System",
+            RadioSettingValueList(
+                systems, current_index=min(p["system"], 3))))
+        mem.extra.append(RadioSetting(
+            "type", "PTT ID Type",
+            RadioSettingValueList(
+                PTT_ID_TYPES,
+                current_index=min(p["type"], len(PTT_ID_TYPES) - 1))))
+        mem.extra.append(RadioSetting(
+            "mode", "PTT ID Mode",
+            RadioSettingValueList(
+                PTT_ID_MODES,
+                current_index=min(p["mode"], len(PTT_ID_MODES) - 1))))
+        mem.extra.append(RadioSetting(
+            "connect", "Connect ID",
+            RadioSettingValueList(
+                ids, current_index=min(p["connect"], 16))))
+        mem.extra.append(RadioSetting(
+            "disconnect", "Disconnect ID",
+            RadioSettingValueList(
+                ids, current_index=min(p["disconnect"], 16))))
+        return mem
+
+    def set_memory(self, mem):
+        p = self._ptt_template(mem.number - 1)
+        off = DTMF_PTT_BASE + (mem.number - 1) * DTMF_PTT_SIZE
+        raw = bytearray(DTMF_PTT_SIZE)
+        raw[0] = _extra_index(mem, "system", p["system"])
+        raw[1] = _extra_index(mem, "type", p["type"])
+        raw[2] = _extra_index(mem, "mode", p["mode"])
+        raw[3] = _extra_index(mem, "connect", p["connect"])
+        raw[4] = _extra_index(mem, "disconnect", p["disconnect"])
+        _set_bytes(self._m(), off, raw)
+
+
+class GD73QuickTextRadio(GD73CollectionRadio):
+    """Quick Text message table."""
+
+    VARIANT = "Quick Text"
+    MAX_RECORDS = 16
+    NAME_LENGTH = 40
+
+    def get_memory(self, number):
+        if number < 1 or number > 16:
+            raise errors.InvalidMemoryLocation(number)
+        if number > self._message_count():
+            return self._base_memory(number, empty=True)
+        value = self._message(number - 1)
+        if not value:
+            return self._base_memory(number, empty=True)
+        return self._base_memory(number, value, empty=False)
+
+    def set_memory(self, mem):
+        number = mem.number
+        if mem.empty:
+            return self.erase_memory(number)
+
+        d = self._m()
+        old_count = self._message_count()
+        if number > old_count:
+            for i in range(old_count, number):
+                _set_bytes(
+                    d, MESSAGE_BASE + 1 + i * 0x51,
+                    b"\x00" * 0x51)
+            _set_bytes(d, MESSAGE_BASE, bytes([number]))
+
+        off = MESSAGE_BASE + 1 + (number - 1) * 0x51
+        msg = mem.name[:40]
+        enc = msg.encode("utf-16le")
+        _set_bytes(d, off, bytes([len(msg)]))
+        _set_bytes(d, off + 1, enc.ljust(0x50, b"\x00"))
+
+    def erase_memory(self, number):
+        d = self._m()
+        _set_bytes(
+            d, MESSAGE_BASE + 1 + (number - 1) * 0x51,
+            b"\x00" * 0x51)
+        count = self._message_count()
+        while count > 0:
+            off = MESSAGE_BASE + 1 + (count - 1) * 0x51
+            if bytes(d[off:off + 0x51]) != b"\x00" * 0x51:
+                break
+            count -= 1
+        _set_bytes(d, MESSAGE_BASE, bytes([count]))
