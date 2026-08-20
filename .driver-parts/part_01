@@ -1,0 +1,332 @@
+            ("iProduct", ctypes.c_uint8),
+            ("iSerialNumber", ctypes.c_uint8),
+            ("bNumConfigurations", ctypes.c_uint8),
+        ]
+
+    class USBDevice(USBPack):
+        pass
+
+    class USBBus(USBPack):
+        pass
+
+    USBDevice._fields_ = [
+        ("next", ctypes.POINTER(USBDevice)),
+        ("prev", ctypes.POINTER(USBDevice)),
+        ("filename", ctypes.c_int8 * (path_max + 1)),
+        ("bus", ctypes.POINTER(USBBus)),
+        ("descriptor", USBDeviceDescriptor),
+        ("config", ctypes.c_void_p),
+        ("dev", ctypes.c_void_p),
+        ("devnum", ctypes.c_uint8),
+        ("num_children", ctypes.c_ubyte),
+        ("children", ctypes.POINTER(ctypes.POINTER(USBDevice))),
+    ]
+
+    USBBus._fields_ = [
+        ("next", ctypes.POINTER(USBBus)),
+        ("prev", ctypes.POINTER(USBBus)),
+        ("dirname", ctypes.c_char * (path_max + 1)),
+        ("devices", ctypes.POINTER(USBDevice)),
+        ("location", ctypes.c_uint32),
+        ("root_dev", ctypes.POINTER(USBDevice)),
+    ]
+
+    def usb_error(lib, prefix):
+        try:
+            raw = lib.usb_strerror()
+            detail = (raw.decode("utf-8", "replace")
+                      if raw else "unknown libusb0 error")
+        except Exception:
+            detail = "unknown libusb0 error"
+        return "%s: %s" % (prefix, detail)
+
+    candidates = ["libusb0.dll"]
+
+    windir = os.environ.get("WINDIR", r"C:\Windows")
+    candidates.extend([
+        os.path.join(windir, "System32", "libusb0.dll"),
+        os.path.join(windir, "SysWOW64", "libusb0.dll"),
+    ])
+
+    lib = None
+    loaded_from = None
+    seen = set()
+    last_error = None
+    for candidate in candidates:
+        if not candidate:
+            continue
+        key = candidate.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            lib = ctypes.WinDLL(candidate)
+            loaded_from = candidate
+            break
+        except Exception as e:
+            last_error = e
+
+    if lib is None:
+        raise errors.RadioError(
+            "Could not load libusb0.dll required for GD-73A USB access: %s" %
+            last_error)
+
+    # Declare only the small libusb-0.1 API subset we actually use.
+    lib.usb_init.argtypes = []
+    lib.usb_init.restype = None
+    lib.usb_find_busses.argtypes = []
+    lib.usb_find_busses.restype = ctypes.c_int
+    lib.usb_find_devices.argtypes = []
+    lib.usb_find_devices.restype = ctypes.c_int
+    lib.usb_get_busses.argtypes = []
+    lib.usb_get_busses.restype = ctypes.POINTER(USBBus)
+    lib.usb_open.argtypes = [ctypes.POINTER(USBDevice)]
+    lib.usb_open.restype = ctypes.c_void_p
+    lib.usb_close.argtypes = [ctypes.c_void_p]
+    lib.usb_close.restype = ctypes.c_int
+    lib.usb_claim_interface.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    lib.usb_claim_interface.restype = ctypes.c_int
+    lib.usb_release_interface.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    lib.usb_release_interface.restype = ctypes.c_int
+    lib.usb_bulk_write.argtypes = [
+        ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p,
+        ctypes.c_int, ctypes.c_int]
+    lib.usb_bulk_write.restype = ctypes.c_int
+    lib.usb_bulk_read.argtypes = [
+        ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p,
+        ctypes.c_int, ctypes.c_int]
+    lib.usb_bulk_read.restype = ctypes.c_int
+    lib.usb_strerror.argtypes = []
+    lib.usb_strerror.restype = ctypes.c_char_p
+
+    LOG.info("GD73 stock-CHIRP backend loaded: %s", loaded_from)
+
+    lib.usb_init()
+    rc = lib.usb_find_busses()
+    if rc < 0:
+        raise errors.RadioError(usb_error(lib, "usb_find_busses failed"))
+    rc = lib.usb_find_devices()
+    if rc < 0:
+        raise errors.RadioError(usb_error(lib, "usb_find_devices failed"))
+
+    class LibUSB0Device:
+        _is_libusb0 = True
+
+        def __init__(self, devptr, handle):
+            self._devptr = devptr
+            self._handle = handle
+            self.bus = "libusb0"
+            self.address = int(devptr.contents.devnum)
+            self._closed = False
+
+        def write(self, endpoint, payload, timeout=USB_TIMEOUT_MS):
+            payload = bytes(payload)
+            buf = ctypes.create_string_buffer(payload, len(payload))
+            rc = lib.usb_bulk_write(
+                self._handle, int(endpoint),
+                ctypes.cast(buf, ctypes.c_void_p),
+                len(payload), int(timeout))
+            if rc < 0:
+                raise errors.RadioError(
+                    usb_error(lib, "GD-73A libusb0 bulk write failed"))
+            return rc
+
+        def read(self, endpoint, size, timeout=USB_TIMEOUT_MS):
+            buf = ctypes.create_string_buffer(int(size))
+            rc = lib.usb_bulk_read(
+                self._handle, int(endpoint),
+                ctypes.cast(buf, ctypes.c_void_p),
+                int(size), int(timeout))
+            if rc < 0:
+                try:
+                    raw = lib.usb_strerror()
+                    detail = (raw.decode("utf-8", "replace").lower()
+                              if raw else "")
+                except Exception:
+                    detail = ""
+                if "timeout" in detail or "timed out" in detail:
+                    return b""
+                raise errors.RadioError(
+                    usb_error(lib, "GD-73A libusb0 bulk read failed"))
+            return bytes(buf.raw[:rc])
+
+        def close(self):
+            if self._closed:
+                return
+            self._closed = True
+            try:
+                lib.usb_release_interface(self._handle, USB_INTERFACE)
+            except Exception:
+                pass
+            try:
+                lib.usb_close(self._handle)
+            except Exception:
+                pass
+
+    bus = lib.usb_get_busses()
+    while bool(bus):
+        dev = bus.contents.devices
+        while bool(dev):
+            desc = dev.contents.descriptor
+            if desc.idVendor == USB_VID and desc.idProduct == USB_PID:
+                handle = lib.usb_open(dev)
+                if not handle:
+                    raise errors.RadioError(
+                        usb_error(lib, "Could not open GD-73A USB device"))
+
+                wrapped = LibUSB0Device(dev, handle)
+                rc = lib.usb_claim_interface(handle, USB_INTERFACE)
+                if rc < 0:
+                    wrapped.close()
+                    raise errors.RadioError(
+                        usb_error(lib, "Could not claim USB interface 0"))
+
+                LOG.info(
+                    "GD73 libusb0 selected address=%s VID=%04X PID=%04X",
+                    wrapped.address, desc.idVendor, desc.idProduct)
+                return wrapped
+
+            dev = dev.contents.next
+        bus = bus.contents.next
+
+    raise errors.RadioError(
+        "GD-73A USB device 1206:0227 was not found through libusb-win32. "
+        "Confirm the radio is powered on and its Windows driver is "
+        "libusb-win32.")
+
+
+@directory.register
+class GD73ARadio(chirp_common.CloneModeRadio):
+    """Radioddity GD-73 / GD-73A experimental full-layout image driver."""
+
+    VENDOR = "Radioddity"
+    MODEL = "GD-73A"
+    VARIANT = "Native USB read v4 / mmap parser fix"
+    BAUD_RATE = 57600
+
+    @classmethod
+    def get_prompts(cls):
+        prompts = chirp_common.RadioPrompts()
+        prompts.experimental = (
+            "GD-73A native-USB read/write support. "
+            "The CHIRP Port selection is only a dummy because this driver "
+            "opens USB VID 1206 PID 0227 directly. Select "
+            "Fake NOP as the port. The serial port is ignored because this radio uses native USB.")
+        prompts.pre_download = (
+            "Connect and power on the GD-73A. The selected serial port is "
+            "ignored by the driver; use Fake NOP as the dummy port for both download and upload.")
+        return prompts
+
+    @classmethod
+    def match_model(cls, filedata, filename):
+        if len(filedata) != IMAGE_SIZE:
+            return False
+        model = filedata[0x21:0x31].split(b"\x00", 1)[0]
+        if model not in (b"GD-73", b"GD-73A"):
+            return False
+        count = struct.unpack_from("<H", filedata, CHANNEL_BANK)[0]
+        return 0 <= count <= 1024
+
+    def process_mmap(self):
+        pass
+
+    def _usb_backend(self):
+        """Return the optional PyUSB backend used only as a fallback."""
+        if usb is None:
+            return None
+
+        if libusb_package is not None:
+            backend = libusb_package.get_libusb1_backend()
+            if backend is not None:
+                LOG.info("GD73 fallback USB backend: libusb-package/libusb-1.0")
+                return backend
+
+        LOG.info("GD73 fallback USB backend: PyUSB automatic backend")
+        return None
+
+    def _open_usb(self):
+        # Stock Windows CHIRP path: no third-party Python packages required.
+        if sys.platform == "win32":
+            try:
+                dev = _open_libusb0_gd73()
+                if dev is not None:
+                    LOG.info(
+                        "GD73 USB interface 0 claimed through libusb-win32 "
+                        "without SET_CONFIGURATION")
+                    LOG.info(
+                        "GD73 C7000 packet flags default = 0x0F "
+                        "(from successful CPS capture)")
+                    return dev
+            except errors.RadioError:
+                # If PyUSB exists (our development/source environment), allow
+                # it as a fallback. In packaged stock CHIRP, this branch will
+                # re-raise because usb is normally unavailable.
+                if usb is None:
+                    raise
+                LOG.exception(
+                    "GD73 direct libusb0 backend failed; trying PyUSB fallback")
+
+        if usb is None:
+            raise errors.RadioError(
+                "GD-73A USB support requires libusb-win32 (libusb0.dll). "
+                "The radio must use the libusb-win32 device driver, as it does "
+                "with the OEM CPS.")
+
+        backend = self._usb_backend()
+        kwargs = {
+            "find_all": True,
+            "idVendor": USB_VID,
+            "idProduct": USB_PID,
+        }
+        if backend is not None:
+            kwargs["backend"] = backend
+
+        devices = list(usb.core.find(**kwargs) or [])
+        if not devices:
+            raise errors.RadioError(
+                "GD-73A USB device 1206:0227 was not found. "
+                "Connect and power on the radio.")
+
+        dev = devices[0]
+        LOG.info(
+            "GD73 PyUSB selected bus=%s address=%s",
+            getattr(dev, "bus", "?"), getattr(dev, "address", "?"))
+
+        try:
+            try:
+                if dev.is_kernel_driver_active(USB_INTERFACE):
+                    dev.detach_kernel_driver(USB_INTERFACE)
+            except (NotImplementedError, usb.core.USBError):
+                pass
+
+            usb.util.claim_interface(dev, USB_INTERFACE)
+            LOG.info(
+                "GD73 USB interface 0 claimed through PyUSB "
+                "without SET_CONFIGURATION")
+            LOG.info(
+                "GD73 C7000 packet flags default = 0x0F "
+                "(from successful CPS capture)")
+        except Exception as e:
+            raise errors.RadioError(
+                "Could not claim GD-73A USB interface 0: %s" % e)
+
+        return dev
+
+    def _usb_send_recv(self, dev, packet):
+        LOG.debug("GD73 USB TX: %s", packet.hex(" "))
+
+        try:
+            wrote = dev.write(
+                USB_EP_OUT, packet, timeout=USB_TIMEOUT_MS)
+        except Exception as e:
+            raise errors.RadioError("GD-73A USB write failed: %s" % e)
+
+        if wrote != len(packet):
+            raise errors.RadioError(
+                "GD-73A short USB write (%d/%d)" % (wrote, len(packet)))
+
+        # OEM CPS capture: median request -> IN submission ~= 872 us.
+        # Avoid time.sleep(0.001) here because packaged Windows Python can
+        # oversleep by an order of magnitude.
+        _gd73_precise_wait(0.00085)
+
