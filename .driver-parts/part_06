@@ -1,0 +1,278 @@
+                                _encode_utf16(str(value).rstrip(), 8))
+                        elif field == "count":
+                            _set_bytes(d, off + 0x10, bytes([int(value)]))
+                        elif field.startswith("member_"):
+                            member = int(field.split("_")[1])
+                            if member < 16:
+                                _set_bytes(
+                                    d, off + 0x11 + member * 2,
+                                    _p16(int(value)))
+
+            # Scan Lists
+            elif name.startswith("scanlist_"):
+                parts = name.split("_")
+                if len(parts) >= 3 and parts[1].isdigit():
+                    idx = int(parts[1])
+                    if idx < self._scanlist_count():
+                        off = SCANLIST_RECORDS + idx * SCANLIST_SIZE
+                        field = "_".join(parts[2:])
+                        if field == "name":
+                            _set_bytes(
+                                d, off,
+                                _encode_utf16(str(value).rstrip(), 8))
+                        elif field == "count":
+                            _set_bytes(d, off + 0x10, bytes([int(value)]))
+                        elif field == "pri1_mode":
+                            _set_bytes(d, off + 0x51, bytes([int(value)]))
+                        elif field == "pri2_mode":
+                            _set_bytes(d, off + 0x52, bytes([int(value)]))
+                        elif field == "pri1_zone":
+                            _set_bytes(d, off + 0x53, bytes([int(value)]))
+                        elif field == "pri2_zone":
+                            _set_bytes(d, off + 0x54, bytes([int(value)]))
+                        elif field == "pri1_channel":
+                            _set_bytes(d, off + 0x55, bytes([int(value)]))
+                        elif field == "pri2_channel":
+                            _set_bytes(d, off + 0x57, bytes([int(value)]))
+                        elif field == "revert_mode":
+                            _set_bytes(d, off + 0x59, bytes([int(value)]))
+                        elif field == "revert_zone":
+                            _set_bytes(d, off + 0x5A, bytes([int(value)]))
+                        elif field == "revert_channel":
+                            _set_bytes(d, off + 0x5B, bytes([int(value)]))
+                        elif field == "rx_hold":
+                            raw = max(0, min(20, int(value) // 500))
+                            _set_bytes(d, off + 0x5D, bytes([raw]))
+                        elif field == "tx_hold":
+                            raw = max(0, min(20, int(value) // 500))
+                            _set_bytes(d, off + 0x5E, bytes([raw]))
+                        elif field.startswith("member_"):
+                            member = int(field.split("_")[1])
+                            if member < 32:
+                                _set_bytes(
+                                    d, off + 0x11 + member * 2,
+                                    _p16(int(value)))
+            # Buttons
+            elif name == "button_long_press":
+                # List index 0 is 0.5 s, raw value 1.
+                _set_bytes(
+                    d, SETTINGS_BASE + 0x88,
+                    bytes([int(value) + 1]))
+            elif name.startswith("button_"):
+                button_offsets = {
+                    "button_p1_short": 0x8B,
+                    "button_p1_long": 0x8C,
+                    "button_p2_short": 0x8D,
+                    "button_p2_long": 0x8E,
+                }
+                if name in button_offsets:
+                    off = SETTINGS_BASE + button_offsets[name]
+                    _set_bytes(d, off, bytes([int(value)]))
+
+            # Quick Text
+            elif name.startswith("quick_") and name[6:].isdigit():
+                idx = int(name[6:])
+                if 0 <= idx < 16:
+                    off = MESSAGE_BASE + 1 + idx * 0x51
+                    msg = str(value).rstrip()[:40]
+                    enc = msg.encode("utf-16le")
+                    _set_bytes(d, off, bytes([len(msg)]))
+                    _set_bytes(d, off + 1, enc.ljust(0x50, b"\x00"))
+
+            # Emergency system - fields validated by CPS screenshot.
+            elif name.startswith("emergency_") and self._emergency_count():
+                off = EMERGENCY_RECORDS
+                if name == "emergency_name":
+                    _set_bytes(
+                        d, off,
+                        _encode_utf16(str(value).rstrip(), 8))
+                elif name == "emergency_type":
+                    _set_bytes(d, off + 0x10, bytes([int(value)]))
+                elif name == "emergency_mode":
+                    _set_bytes(d, off + 0x11, bytes([int(value)]))
+                elif name == "emergency_revert":
+                    _set_bytes(d, off + 0x12, bytes([int(value)]))
+                elif name == "emergency_retries":
+                    _set_bytes(d, off + 0x14, bytes([int(value)]))
+
+            # DTMF Codes: exact 9-byte CPS-validated numeric BCD records.
+            elif name.startswith("dtmf_code_") and name[10:].isdigit():
+                idx = int(name[10:])
+                if 0 <= idx < 16:
+                    off = DTMF_NUMBER_BASE + idx * DTMF_NUMBER_SIZE
+                    _set_bytes(
+                        d, off, self._encode_dtmf_number(value))
+
+            # DTMF systems
+            elif name.startswith("dtmf_") and "_sidetone" in name:
+                idx = int(name.split("_")[1])
+                off = DTMF_SYSTEM_BASE + idx * DTMF_SYSTEM_SIZE
+                _set_bytes(d, off, bytes([1 if bool(value) else 0]))
+            elif name.startswith("dtmf_") and "_pre" in name:
+                idx = int(name.split("_")[1])
+                off = DTMF_SYSTEM_BASE + idx * DTMF_SYSTEM_SIZE
+                _set_bytes(
+                    d, off + 1,
+                    bytes([max(0, min(100, int(value)//10))]))
+            elif name.startswith("dtmf_") and "_tone" in name:
+                idx = int(name.split("_")[1])
+                off = DTMF_SYSTEM_BASE + idx * DTMF_SYSTEM_SIZE
+                raw = max(0, min(187, (int(value)-30)//10))
+                _set_bytes(d, off + 2, bytes([raw]))
+            elif name.startswith("dtmf_") and "_interval" in name:
+                idx = int(name.split("_")[1])
+                off = DTMF_SYSTEM_BASE + idx * DTMF_SYSTEM_SIZE
+                raw = max(0, min(187, (int(value)-30)//10))
+                _set_bytes(d, off + 3, bytes([raw]))
+            elif name.startswith("dtmf_") and "_restore" in name:
+                idx = int(name.split("_")[1])
+                off = DTMF_SYSTEM_BASE + idx * DTMF_SYSTEM_SIZE
+                raw = max(0, min(164, (int(value)-200)//200))
+                _set_bytes(d, off + 4, bytes([raw]))
+
+            # PTT templates
+            elif name.startswith("ptt_"):
+                parts = name.split("_")
+                if len(parts) >= 3 and parts[1].isdigit():
+                    idx = int(parts[1])
+                    if idx < 32:
+                        off = DTMF_PTT_BASE + idx * DTMF_PTT_SIZE
+                        field = "_".join(parts[2:])
+                        field_offsets = {
+                            "system": 0, "type": 1, "mode": 2,
+                            "connect": 3, "disconnect": 4,
+                        }
+                        if field in field_offsets:
+                            o = off + field_offsets[field]
+                            _set_bytes(d, o, bytes([int(value)]))
+
+            else:
+                LOG.debug("Ignoring non-writable GD-73 setting %s", name)
+
+
+
+# ============================================================================
+# Standard CHIRP subdevices
+#
+# CHIRP's regular editor creates one Memories editor per subdevice returned by
+# get_sub_devices(). This requires no wx/UI modification and therefore remains
+# a normal drop-in CHIRP driver.
+# ============================================================================
+
+_COLLECTION_IMMUTABLE = [
+    "freq", "duplex", "offset", "tmode", "rtone", "ctone",
+    "dtcs", "rx_dtcs", "dtcs_polarity", "cross_mode",
+    "mode", "tuning_step", "skip", "power",
+]
+
+
+def _extra_index(mem, name, default=0):
+    try:
+        return int(mem.extra[name].value)
+    except (AttributeError, KeyError, TypeError, ValueError):
+        return default
+
+
+def _extra_string(mem, name, default=""):
+    try:
+        return str(mem.extra[name].value).strip()
+    except (AttributeError, KeyError):
+        return default
+
+
+class GD73CollectionRadio(GD73ARadio):
+    """Base for non-RF GD-73 tables shown in CHIRP's normal Memories editor."""
+
+    MAX_RECORDS = 1
+    NAME_LENGTH = 16
+    VARIANT = "Collection"
+
+    def get_features(self):
+        rf = chirp_common.RadioFeatures()
+        rf.memory_bounds = (1, self.MAX_RECORDS)
+        rf.has_sub_devices = False
+        rf.has_settings = False
+        rf.has_bank = False
+        rf.has_bank_names = False
+        rf.has_name = True
+        rf.has_comment = False
+        rf.has_mode = False
+        rf.has_offset = False
+        rf.has_tuning_step = False
+        rf.has_ctone = False
+        rf.has_dtcs = False
+        rf.has_rx_dtcs = False
+        rf.has_dtcs_polarity = False
+        rf.has_cross = False
+        # Keep a valid internal RF profile so CHIRP's generic Memory object
+        # remains happy, but selectively empty only the feature lists whose
+        # columns we want hidden in these non-RF collection editors.
+        rf.valid_modes = ["FM"]              # hidden by has_mode=False
+        rf.valid_tmodes = []                 # hide Tone Mode
+        rf.valid_tones = []                  # hide Tone / Tone Squelch
+        rf.valid_dtcs_codes = []             # DTCS already hidden by flags
+        rf.valid_cross_modes = []
+        rf.valid_duplexes = []               # hide Duplex
+        rf.valid_tuning_steps = [5.0]        # hidden by has_tuning_step=False
+        rf.valid_bands = [(400000000, 470000000)]  # valid UHF placeholder band
+        rf.valid_skips = []                  # hide Skip
+        rf.valid_power_levels = []           # hide Power
+        rf.valid_name_length = self.NAME_LENGTH
+        rf.valid_characters = chirp_common.CHARSET_ASCII
+        rf.can_delete = True
+        return rf
+
+    def _base_memory(self, number, name="", empty=False):
+        mem = chirp_common.Memory()
+        mem.number = number
+        mem.empty = empty
+        # Internal-only placeholder; frequency is immutable and the
+        # collection feature profile hides the RF controls.
+        mem.freq = 400000000
+        mem.name = name or ""
+        mem.duplex = ""
+        mem.mode = "FM"
+        mem.tmode = ""
+        mem.skip = ""
+        mem.extra = RadioSettingGroup("extra", "Extra")
+        mem.immutable = list(_COLLECTION_IMMUTABLE)
+        return mem
+
+    def _zero_record(self, offset, size):
+        _set_bytes(self._m(), offset, b"\x00" * size)
+
+
+class GD73ChannelsRadio(GD73ARadio):
+    """The actual RF channel table."""
+
+    VARIANT = "Channels"
+
+    def get_features(self):
+        rf = super().get_features()
+        rf.has_sub_devices = False
+        rf.has_settings = False
+        return rf
+
+
+class GD73ContactsRadio(GD73CollectionRadio):
+    """Digital Contact table as a normal CHIRP subdevice."""
+
+    VARIANT = "Digital Contacts"
+    MAX_RECORDS = 1024
+    NAME_LENGTH = 16
+
+    def get_memory(self, number):
+        if number < 1 or number > self.MAX_RECORDS:
+            raise errors.InvalidMemoryLocation(number)
+
+        count = self._contact_count()
+        if number > count:
+            return self._base_memory(number, empty=True)
+
+        d = self._m()
+        off = CONTACT_RECORDS + (number - 1) * CONTACT_SIZE
+        raw = bytes(d[off:off + CONTACT_SIZE])
+        if raw == b"\x00" * CONTACT_SIZE:
+            return self._base_memory(number, empty=True)
+
+        c = self._contact(number - 1)
